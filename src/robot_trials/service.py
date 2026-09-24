@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
@@ -16,15 +16,23 @@ from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
 
+def _parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 ROLE_PERMISSIONS = {
     "operator": {
         "catalog.write", "batch.create", "batch.start", "observation.import",
-        "exclusion.request", "exclusion.revoke",
+        "exclusion.request", "exclusion.revoke", "appeal.submit",
     },
     "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
-    "approver": {"decision.write"},
+    "approver": {"decision.write", "appeal.review"},
     "auditor": {"report.read", "audit.read"},
 }
+
+APPEAL_WINDOW = timedelta(days=7)
+
+_KIND_ORDER = {"decision": 0, "appeal": 1, "review": 2, "analysis": 3}
 
 
 class TrialService:
@@ -217,8 +225,8 @@ class TrialService:
         if existing is not None:
             return existing
         batch = self.get_batch(batch_id)
-        if batch["state"] != "running":
-            raise InvalidState("只有运行中的批次可以导入观测")
+        if batch["state"] not in {"running", "reanalyzing"}:
+            raise InvalidState("只有运行中或复议重分析中的批次可以导入观测")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
         parsed: list[Observation] = []
         for raw in rows:
@@ -317,7 +325,7 @@ class TrialService:
         if row["requested_by"] != actor_id:
             raise Forbidden("只有原申请人可以撤销排除")
         batch = self.get_batch(row["batch_id"])
-        if batch["state"] != "running":
+        if batch["state"] not in {"running", "reanalyzing"}:
             raise InvalidState("批次封存后不能改变排除状态")
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
@@ -345,21 +353,39 @@ class TrialService:
             ).fetchone()[0]
             if pending:
                 raise InvalidState("仍有待复核的排除申请")
+            now = self._now()
             cursor = self.connection.execute(
                 "UPDATE batches SET state='sealed',revision=revision+1,sealed_at=? "
                 "WHERE batch_id=? AND state='running' AND revision=?",
-                (self._now(), batch_id, expected_revision),
+                (now, batch_id, expected_revision),
             )
-            if cursor.rowcount != 1:
-                raise InvalidState("批次状态或版本已变化")
-            new_revision = expected_revision + 1
-            now = self._now()
-            self.connection.execute(
-                "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
-                "VALUES(?,?, 'queued', ?,?,?)",
-                (batch_id, new_revision, now, now, now),
-            )
-            self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
+            if cursor.rowcount == 1:
+                new_revision = expected_revision + 1
+                self.connection.execute(
+                    "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
+                    "VALUES(?,?, 'queued', ?,?,?)",
+                    (batch_id, new_revision, now, now, now),
+                )
+                self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
+            else:
+                cursor = self.connection.execute(
+                    "UPDATE batches SET state='sealed',sealed_at=? "
+                    "WHERE batch_id=? AND state='reanalyzing' AND revision=?",
+                    (now, batch_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidState("批次状态或版本已变化")
+                job = self.connection.execute(
+                    "UPDATE analysis_jobs SET state='queued',available_at=?,updated_at=? "
+                    "WHERE batch_id=? AND batch_revision=? AND state='waiting'",
+                    (now, now, batch_id, expected_revision),
+                )
+                if job.rowcount != 1:
+                    raise InvalidState("重分析任务缺失或已被领取")
+                self._audit(
+                    "batch", batch_id, "batch.sealed", actor_id,
+                    {"revision": expected_revision, "reanalysis": True},
+                )
         return self.get_batch(batch_id)
 
     def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
@@ -502,17 +528,174 @@ class TrialService:
                     "VALUES(?,?,?,?,?,?)",
                     (batch_id, analysis_id, decision, reason, actor_id, self._now()),
                 )
+                new_decision_id = cursor.lastrowid
+                self.connection.execute(
+                    "UPDATE decisions SET superseded_by_appeal_id="
+                    "(SELECT da.appeal_id FROM decision_appeals da "
+                    "WHERE da.decision_id=decisions.decision_id AND da.status='reanalyze' "
+                    "ORDER BY da.appeal_id DESC LIMIT 1) "
+                    "WHERE batch_id=? AND decision_id<>? AND superseded_by_appeal_id IS NULL",
+                    (batch_id, new_decision_id),
+                )
                 self.connection.execute("UPDATE batches SET state='decided' WHERE batch_id=?", (batch_id,))
                 self._audit(
                     "batch",
                     batch_id,
                     "decision.recorded",
                     actor_id,
-                    {"decision_id": cursor.lastrowid, "analysis_id": analysis_id, "decision": decision},
+                    {"decision_id": new_decision_id, "analysis_id": analysis_id, "decision": decision},
                 )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该分析版本已经形成决定") from exc
         return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
+
+    def submit_appeal(
+        self, actor_id: str, decision_id: int, evidence_summary: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "appeal.submit")
+        if not evidence_summary.strip():
+            raise ValidationFailed("证据摘要不能为空")
+        decision = self.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (decision_id,)
+        ).fetchone()
+        if decision is None:
+            raise NotFound("决定不存在")
+        batch = self.get_batch(decision["batch_id"])
+        if batch["created_by"] != actor_id:
+            raise Forbidden("只有批次所属操作方可以申诉该批次的决定")
+        if self.clock.now() - _parse_ts(decision["decided_at"]) > APPEAL_WINDOW:
+            raise InvalidState("超过申诉期限，不能对过期决定提出申诉")
+        try:
+            with transaction(self.connection, immediate=True):
+                existing = self.connection.execute(
+                    "SELECT status FROM decision_appeals WHERE decision_id=? ORDER BY appeal_id LIMIT 1",
+                    (decision_id,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["status"] == "pending":
+                        raise Conflict("该决定已有待审申诉")
+                    raise Conflict("该决定的申诉已经裁决，不能再次申诉")
+                cursor = self.connection.execute(
+                    "INSERT INTO decision_appeals(decision_id,batch_id,evidence_summary,appealed_by,appealed_at,status) "
+                    "VALUES(?,?,?,?,?, 'pending')",
+                    (decision_id, decision["batch_id"], evidence_summary.strip(), actor_id, self._now()),
+                )
+                appeal_id = cursor.lastrowid
+                self._audit(
+                    "decision",
+                    str(decision_id),
+                    "appeal.submitted",
+                    actor_id,
+                    {"appeal_id": appeal_id, "batch_id": decision["batch_id"]},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("该决定已有待审申诉") from exc
+        return {"appeal_id": appeal_id, "decision_id": decision_id, "status": "pending"}
+
+    def review_appeal(
+        self, actor_id: str, appeal_id: int, action: str, note: str, reanalysis_directive: str = ""
+    ) -> dict[str, Any]:
+        self._require(actor_id, "appeal.review")
+        if action not in {"uphold", "revoke", "reanalyze"}:
+            raise ValidationFailed("未知复议动作")
+        if not note.strip():
+            raise ValidationFailed("复议意见不能为空")
+        directive = reanalysis_directive.strip()
+        if action == "reanalyze" and not directive:
+            raise ValidationFailed("要求重新分析必须给出明确的排除变更或补充材料要求")
+        appeal = self.connection.execute(
+            "SELECT * FROM decision_appeals WHERE appeal_id=?", (appeal_id,)
+        ).fetchone()
+        if appeal is None:
+            raise NotFound("申诉不存在")
+        if appeal["status"] != "pending":
+            raise InvalidState("申诉已经裁决")
+        decision = self.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (appeal["decision_id"],)
+        ).fetchone()
+        if decision["decided_by"] == actor_id:
+            raise Forbidden("原决定人不得担任复议人")
+        status = {"uphold": "upheld", "revoke": "revoked", "reanalyze": "reanalyze"}[action]
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE decision_appeals SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+                "WHERE appeal_id=? AND status='pending'",
+                (status, actor_id, self._now(), note.strip(), appeal_id),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("申诉已被并发裁决")
+            reanalysis_job_id: int | None = None
+            reanalysis_revision: int | None = None
+            if action == "revoke":
+                self.connection.execute(
+                    "UPDATE batches SET state='decided' WHERE batch_id=?",
+                    (appeal["batch_id"],),
+                )
+            if action == "reanalyze":
+                batch = self.get_batch(appeal["batch_id"])
+                new_revision = batch["revision"] + 1
+                now = self._now()
+                job_cursor = self.connection.execute(
+                    "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
+                    "VALUES(?,?, 'waiting', ?,?,?)",
+                    (appeal["batch_id"], new_revision, now, now, now),
+                )
+                reanalysis_job_id = job_cursor.lastrowid
+                reanalysis_revision = new_revision
+                self.connection.execute(
+                    "UPDATE batches SET state='reanalyzing',revision=? WHERE batch_id=?",
+                    (new_revision, appeal["batch_id"]),
+                )
+                self.connection.execute(
+                    "UPDATE decision_appeals SET reanalysis_job_id=?,reanalysis_batch_revision=?,"
+                    "reanalysis_directive=? WHERE appeal_id=?",
+                    (reanalysis_job_id, new_revision, directive, appeal_id),
+                )
+                self._audit(
+                    "batch",
+                    appeal["batch_id"],
+                    "batch.reopened",
+                    actor_id,
+                    {
+                        "appeal_id": appeal_id,
+                        "revision": new_revision,
+                        "job_id": reanalysis_job_id,
+                        "directive": directive,
+                    },
+                )
+            self._audit(
+                "decision",
+                str(appeal["decision_id"]),
+                f"appeal.{status}",
+                actor_id,
+                {
+                    "appeal_id": appeal_id,
+                    "batch_id": appeal["batch_id"],
+                    **(
+                        {
+                            "job_id": reanalysis_job_id,
+                            "revision": reanalysis_revision,
+                            "directive": directive,
+                        }
+                        if action == "reanalyze"
+                        else {}
+                    ),
+                },
+            )
+        return {
+            "appeal_id": appeal_id,
+            "decision_id": appeal["decision_id"],
+            "status": status,
+            **(
+                {
+                    "reanalysis_job_id": reanalysis_job_id,
+                    "reanalysis_batch_revision": reanalysis_revision,
+                    "reanalysis_directive": directive,
+                }
+                if action == "reanalyze"
+                else {}
+            ),
+        }
 
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
@@ -520,24 +703,159 @@ class TrialService:
             raise Forbidden("当前角色不能读取完整报告")
         batch = self.get_batch(batch_id)
         protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        analysis_row = self.connection.execute(
-            "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1", (batch_id,)
-        ).fetchone()
-        decision_row = None
-        if analysis_row is not None:
-            decision_row = self.connection.execute(
-                "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
-            ).fetchone()
+        analyses = {
+            row["analysis_id"]: row
+            for row in self.connection.execute(
+                "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id", (batch_id,)
+            ).fetchall()
+        }
+        decisions = self.connection.execute(
+            "SELECT * FROM decisions WHERE batch_id=? ORDER BY decision_id", (batch_id,)
+        ).fetchall()
+        appeals = self.connection.execute(
+            "SELECT * FROM decision_appeals WHERE batch_id=? ORDER BY appeal_id", (batch_id,)
+        ).fetchall()
+
+        timeline: list[dict[str, Any]] = []
+        for row in decisions:
+            item = dict(row)
+            analysis_row = analyses.get(row["analysis_id"])
+            item["analysis"] = None if analysis_row is None else {
+                "analysis_id": analysis_row["analysis_id"],
+                "batch_revision": analysis_row["batch_revision"],
+                "input_sha256": analysis_row["input_sha256"],
+                "algorithm_version": analysis_row["algorithm_version"],
+                "created_by": analysis_row["created_by"],
+                "result": json.loads(analysis_row["result_json"]),
+            }
+            timeline.append({"at": row["decided_at"], "kind": "decision", "item": item})
+        for row in appeals:
+            timeline.append({
+                "at": row["appealed_at"],
+                "kind": "appeal",
+                "item": {
+                    "appeal_id": row["appeal_id"],
+                    "decision_id": row["decision_id"],
+                    "evidence_summary": row["evidence_summary"],
+                    "appealed_by": row["appealed_by"],
+                    "status": row["status"],
+                },
+            })
+            if row["reviewed_at"] is not None:
+                timeline.append({
+                    "at": row["reviewed_at"],
+                    "kind": "review",
+                    "item": {
+                        "appeal_id": row["appeal_id"],
+                        "decision_id": row["decision_id"],
+                        "outcome": row["status"],
+                        "reviewed_by": row["reviewed_by"],
+                        "review_note": row["review_note"],
+                        **(
+                            {
+                                "reanalysis_job_id": row["reanalysis_job_id"],
+                                "reanalysis_batch_revision": row["reanalysis_batch_revision"],
+                                "reanalysis_directive": row["reanalysis_directive"],
+                            }
+                            if row["status"] == "reanalyze"
+                            else {}
+                        ),
+                    },
+                })
+        analysis_events = [
+            (json.loads(row["payload_json"]), row["created_at"])
+            for row in self.connection.execute(
+                "SELECT created_at,payload_json FROM audit_events "
+                "WHERE entity_type='batch' AND entity_id=? AND event_type='analysis.completed' "
+                "ORDER BY event_id",
+                (batch_id,),
+            ).fetchall()
+        ]
+        for payload, created_at in analysis_events:
+            analysis_id = payload.get("analysis_id")
+            analysis_row = analyses.get(analysis_id)
+            if analysis_row is None:
+                continue
+            timeline.append({
+                "at": created_at,
+                "kind": "analysis",
+                "item": {
+                    "analysis_id": analysis_row["analysis_id"],
+                    "batch_revision": analysis_row["batch_revision"],
+                    "input_sha256": analysis_row["input_sha256"],
+                    "algorithm_version": analysis_row["algorithm_version"],
+                    "created_by": analysis_row["created_by"],
+                    "result": json.loads(analysis_row["result_json"]),
+                },
+            })
+        timeline.sort(key=lambda entry: (entry["at"], _KIND_ORDER[entry["kind"]]))
+
+        decision_by_id = {row["decision_id"]: row for row in decisions}
+        appeals_by_decision: dict[int, list[sqlite3.Row]] = {}
+        for row in appeals:
+            appeals_by_decision.setdefault(row["decision_id"], []).append(row)
+        for entry in timeline:
+            if entry["kind"] != "decision":
+                continue
+            item = entry["item"]
+            item["superseded"] = item["superseded_by_appeal_id"] is not None
+            appeal_row = None
+            if item["superseded_by_appeal_id"] is not None:
+                appeal_row = next(
+                    (row for row in appeals if row["appeal_id"] == item["superseded_by_appeal_id"]),
+                    None,
+                )
+                item["superseded_reason"] = None if appeal_row is None else appeal_row["status"]
+            outcomes = [row["status"] for row in appeals_by_decision.get(item["decision_id"], [])]
+            if "revoked" in outcomes:
+                item["effect"] = "revoked"
+            elif "reanalyze" in outcomes or item["superseded_by_appeal_id"] is not None:
+                item["effect"] = "superseded_by_reanalysis"
+            else:
+                item["effect"] = "in_force"
+
+        effective_decision = None
+        if decisions:
+            effective_decision = dict(decisions[-1])
+            effective_appeal = next(
+                (row for row in reversed(appeals) if row["decision_id"] == effective_decision["decision_id"]),
+                None,
+            )
+            effective_status = "in_force"
+            if effective_appeal is not None and effective_appeal["status"] in {"revoked", "reanalyze"}:
+                effective_status = (
+                    "revoked" if effective_appeal["status"] == "revoked" else "superseded_by_reanalysis"
+                )
+            effective_decision["effective_status"] = effective_status
+
+        latest_analysis_row = None
+        if analyses:
+            latest_analysis_row = analyses[max(analyses)]
+        effective_analysis_id = None
+        if effective_decision is not None and effective_decision["effective_status"] == "in_force":
+            effective_analysis_id = effective_decision["analysis_id"]
+        elif (
+            latest_analysis_row is not None
+            and latest_analysis_row["batch_revision"] == batch["revision"]
+        ):
+            effective_analysis_id = latest_analysis_row["analysis_id"]
+
+        decision_ids = [row["decision_id"] for row in decisions]
+        event_rows = self.connection.execute(
+            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE (entity_type='batch' AND entity_id=?) "
+            "OR (entity_type='decision' AND entity_id IN (SELECT value FROM json_each(?))) "
+            "ORDER BY event_id",
+            (batch_id, canonical_json([str(value) for value in decision_ids])),
+        ).fetchall()
+
         exclusions = self.connection.execute(
             "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by "
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
-        events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
-        ).fetchall()
+        latest_decision_row = None if not decisions else decision_by_id[effective_decision["decision_id"]]
+
         return {
             "batch": batch,
             "protocol": {
@@ -547,14 +865,28 @@ class TrialService:
                 "seed": protocol.seed,
                 "bootstrap_samples": protocol.bootstrap_samples,
             },
-            "analysis": None if analysis_row is None else {
-                "analysis_id": analysis_row["analysis_id"],
-                "input_sha256": analysis_row["input_sha256"],
-                "algorithm_version": analysis_row["algorithm_version"],
-                "created_by": analysis_row["created_by"],
-                "result": json.loads(analysis_row["result_json"]),
+            "timeline": timeline,
+            "current": {
+                "batch_state": batch["state"],
+                "batch_revision": batch["revision"],
+                "effective_decision": None if effective_decision is None else {
+                    "decision_id": effective_decision["decision_id"],
+                    "decision": effective_decision["decision"],
+                    "effective_status": effective_decision["effective_status"],
+                    "decided_by": effective_decision["decided_by"],
+                    "decided_at": effective_decision["decided_at"],
+                },
+                "effective_analysis_id": effective_analysis_id,
             },
-            "decision": None if decision_row is None else dict(decision_row),
+            "analysis": None if latest_analysis_row is None else {
+                "analysis_id": latest_analysis_row["analysis_id"],
+                "batch_revision": latest_analysis_row["batch_revision"],
+                "input_sha256": latest_analysis_row["input_sha256"],
+                "algorithm_version": latest_analysis_row["algorithm_version"],
+                "created_by": latest_analysis_row["created_by"],
+                "result": json.loads(latest_analysis_row["result_json"]),
+            },
+            "decision": None if latest_decision_row is None else dict(latest_decision_row),
             "exclusions": [dict(row) for row in exclusions],
-            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in event_rows],
         }

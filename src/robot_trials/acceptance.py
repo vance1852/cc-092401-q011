@@ -50,7 +50,7 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",

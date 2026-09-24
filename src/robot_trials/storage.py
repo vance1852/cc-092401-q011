@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS batches (
     protocol_id TEXT NOT NULL,
     protocol_version INTEGER NOT NULL,
     build_id TEXT NOT NULL REFERENCES builds(build_id),
-    state TEXT NOT NULL CHECK (state IN ('draft', 'running', 'sealed', 'analyzing', 'analyzed', 'decided')),
+    state TEXT NOT NULL CHECK (state IN ('draft', 'running', 'sealed', 'analyzing', 'analyzed', 'decided', 'reanalyzing')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     created_by TEXT NOT NULL REFERENCES users(user_id),
     created_at TEXT NOT NULL,
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed', 'waiting')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
@@ -145,8 +145,31 @@ CREATE TABLE IF NOT EXISTS decisions (
     reason TEXT NOT NULL,
     decided_by TEXT NOT NULL REFERENCES users(user_id),
     decided_at TEXT NOT NULL,
+    superseded_by_appeal_id INTEGER,
     UNIQUE (batch_id, analysis_id)
 );
+
+CREATE TABLE IF NOT EXISTS decision_appeals (
+    appeal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL REFERENCES decisions(decision_id),
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    evidence_summary TEXT NOT NULL,
+    appealed_by TEXT NOT NULL REFERENCES users(user_id),
+    appealed_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'upheld', 'revoked', 'reanalyze')),
+    reviewed_by TEXT REFERENCES users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    reanalysis_directive TEXT,
+    reanalysis_job_id INTEGER REFERENCES analysis_jobs(job_id),
+    reanalysis_batch_revision INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_appeal_per_decision
+ON decision_appeals(decision_id)
+WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS appeals_by_batch ON decision_appeals(batch_id, appeal_id);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,7 +185,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "decision_appeals", "audit_events",
 })
 
 

@@ -133,6 +133,18 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "decisions" and parts[2] == "appeals":
+                result = self.service.submit_appeal(
+                    self._actor(normalized_headers), int(parts[1]), payload["evidence_summary"]
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "appeals" and parts[2] == "review":
+                result = self.service.review_appeal(
+                    self._actor(normalized_headers), int(parts[1]),
+                    payload["action"], payload.get("note", ""),
+                    payload.get("reanalysis_directive", ""),
+                )
+                return Response(200, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
