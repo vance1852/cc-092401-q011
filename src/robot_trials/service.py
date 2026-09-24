@@ -19,20 +19,29 @@ from .storage import initialize, transaction
 ROLE_PERMISSIONS = {
     "operator": {
         "catalog.write", "batch.create", "batch.start", "observation.import",
-        "exclusion.request", "exclusion.revoke",
+        "exclusion.request", "exclusion.revoke", "appeal.submit",
     },
     "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
-    "approver": {"decision.write"},
+    "approver": {"decision.write", "appeal.review"},
     "auditor": {"report.read", "audit.read"},
 }
+
+# 决定作出后的申诉期限；超过期限的决定不再允许提交申诉。
+DEFAULT_APPEAL_WINDOW = timedelta(days=30)
 
 
 class TrialService:
     """在单个 SQLite 连接上提供全部业务操作。"""
 
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        clock=None,
+        appeal_window: timedelta = DEFAULT_APPEAL_WINDOW,
+    ) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        self.appeal_window = appeal_window
         initialize(connection)
 
     def _now(self) -> str:
@@ -495,24 +504,329 @@ class TrialService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        expires_at = (
+            isoformat(self.clock.now() + self.appeal_window)
+            if self.appeal_window is not None
+            else None
+        )
+        decision_id: int | None = None
         try:
             with transaction(self.connection, immediate=True):
+                # 竞态敏感的守卫必须在写事务内再次读取，才能挡住并发提交的申诉或重分析。
+                if self.connection.execute(
+                    "SELECT 1 FROM batches WHERE reanalysis_of_batch=? LIMIT 1", (batch_id,)
+                ).fetchone() is not None:
+                    raise InvalidState("该批次修订已被后续修订取代，不能再形成决定")
+                if self.connection.execute(
+                    "SELECT 1 FROM decisions WHERE batch_id=? AND status != 'active' LIMIT 1",
+                    (batch_id,),
+                ).fetchone() is not None:
+                    raise InvalidState("该批次已有被撤销或被取代的决定，不能在原修订上再次决定")
+                if self.connection.execute(
+                    "SELECT 1 FROM appeals WHERE batch_id=? AND status='pending'", (batch_id,)
+                ).fetchone() is not None:
+                    raise InvalidState("存在待审申诉，不能在复议结束前形成新决定")
                 cursor = self.connection.execute(
-                    "INSERT INTO decisions(batch_id,analysis_id,decision,reason,decided_by,decided_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (batch_id, analysis_id, decision, reason, actor_id, self._now()),
+                    "INSERT INTO decisions(batch_id,analysis_id,decision,reason,decided_by,decided_at,expires_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (batch_id, analysis_id, decision, reason, actor_id, self._now(), expires_at),
                 )
+                decision_id = cursor.lastrowid
                 self.connection.execute("UPDATE batches SET state='decided' WHERE batch_id=?", (batch_id,))
+                # 新修订形成决定后，回填修订链上各“被取代”决定的取代关系与时间。
+                ancestor = batch["reanalysis_of_batch"]
+                while ancestor is not None:
+                    self.connection.execute(
+                        "UPDATE decisions SET superseded_by_decision_id=?,superseded_at=COALESCE(superseded_at,?) "
+                        "WHERE batch_id=? AND status='superseded' AND superseded_by_decision_id IS NULL",
+                        (decision_id, self._now(), ancestor),
+                    )
+                    ancestor = self.get_batch(ancestor)["reanalysis_of_batch"]
                 self._audit(
                     "batch",
                     batch_id,
                     "decision.recorded",
                     actor_id,
-                    {"decision_id": cursor.lastrowid, "analysis_id": analysis_id, "decision": decision},
+                    {"decision_id": decision_id, "analysis_id": analysis_id, "decision": decision},
                 )
         except sqlite3.IntegrityError as exc:
-            raise Conflict("该分析版本已经形成决定") from exc
-        return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
+            raise Conflict("该批次已有当前有效决定或该分析版本已经形成决定") from exc
+        return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision,
+                "decision_id": decision_id}
+
+    def submit_appeal(
+        self, actor_id: str, batch_id: str, decision_id: int, evidence_summary: str
+    ) -> dict[str, Any]:
+        """批次所属操作方对一份当前有效决定提交一次带证据摘要的申诉。"""
+
+        self._require(actor_id, "appeal.submit")
+        summary = evidence_summary.strip() if isinstance(evidence_summary, str) else ""
+        if not summary:
+            raise ValidationFailed("证据摘要不能为空")
+        batch = self.get_batch(batch_id)
+        if batch["created_by"] != actor_id:
+            raise Forbidden("只有批次所属操作方可以提交申诉")
+        decision_row = self.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=? AND batch_id=?", (decision_id, batch_id)
+        ).fetchone()
+        if decision_row is None:
+            raise NotFound("决定不存在或不属于该批次")
+        if decision_row["status"] != "active":
+            raise InvalidState("只能对当前有效决定申诉")
+        if (
+            decision_row["expires_at"] is not None
+            and decision_row["expires_at"] <= self._now()
+        ):
+            raise InvalidState("决定已超过申诉期限，不能再申诉")
+        try:
+            with transaction(self.connection, immediate=True):
+                # 条件插入：决定仍有效且未过申诉窗口才允许；并发下只有一个事务能插入待审申诉。
+                now = self._now()
+                cursor = self.connection.execute(
+                    "INSERT INTO appeals(decision_id,batch_id,evidence_summary,requested_by,requested_at,status) "
+                    "SELECT ?,?,?,?,?,'pending' "
+                    "WHERE EXISTS (SELECT 1 FROM decisions WHERE decision_id=? AND status='active' "
+                    "              AND (expires_at IS NULL OR expires_at > ?)) "
+                    "AND NOT EXISTS (SELECT 1 FROM appeals WHERE decision_id=?) "
+                    "AND NOT EXISTS (SELECT 1 FROM appeals WHERE batch_id=? AND status='pending')",
+                    (
+                        decision_id, batch_id, summary, actor_id, now,
+                        decision_id, now, decision_id, batch_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    current = self.connection.execute(
+                        "SELECT status,expires_at FROM decisions WHERE decision_id=?", (decision_id,)
+                    ).fetchone()
+                    if current is None or current["status"] != "active":
+                        raise InvalidState("只能对当前有效决定申诉")
+                    if current["expires_at"] is not None and current["expires_at"] <= now:
+                        raise InvalidState("决定已超过申诉期限，不能再申诉")
+                    raise Conflict("该决定已有申诉或批次存在待审申诉")
+                appeal_id = cursor.lastrowid
+                self._audit(
+                    "batch",
+                    batch_id,
+                    "appeal.submitted",
+                    actor_id,
+                    {"appeal_id": appeal_id, "decision_id": decision_id, "evidence_summary": summary},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("该决定已有申诉或批次存在待审申诉") from exc
+        return {"appeal_id": appeal_id, "decision_id": decision_id, "status": "pending"}
+
+    def review_appeal(
+        self, actor_id: str, appeal_id: int, outcome: str, note: str
+    ) -> dict[str, Any]:
+        """另一名审批人对申诉作出维持、撤销或要求重新分析的裁决。"""
+
+        self._require(actor_id, "appeal.review")
+        if outcome not in {"uphold", "revoke", "reanalyze"}:
+            raise ValidationFailed("复议结果必须是 uphold、revoke 或 reanalyze")
+        review_note = note.strip() if isinstance(note, str) else ""
+        if outcome == "reanalyze" and not review_note:
+            raise ValidationFailed("要求重新分析必须说明明确的排除变更或补充材料")
+        appeal_status = {"uphold": "upheld", "revoke": "revoked", "reanalyze": "reanalyze"}[outcome]
+        appeal_row = self.connection.execute(
+            "SELECT * FROM appeals WHERE appeal_id=?", (appeal_id,)
+        ).fetchone()
+        if appeal_row is None:
+            raise NotFound("申诉不存在")
+        if appeal_row["status"] != "pending":
+            raise InvalidState("申诉已经裁决")
+        decision_row = self.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (appeal_row["decision_id"],)
+        ).fetchone()
+        if decision_row["decided_by"] == actor_id:
+            raise Forbidden("原决定人不能担任复议人")
+        batch_id = appeal_row["batch_id"]
+        now = self._now()
+        reanalysis_batch_id: str | None = None
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE appeals SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+                "WHERE appeal_id=? AND status='pending'",
+                (appeal_status, actor_id, now, review_note, appeal_id),
+            )
+            if cursor.rowcount != 1:
+                # 并发下另一名复议人已经裁决：阻止双重裁决。
+                raise Conflict("申诉已被其他复议人裁决")
+            if outcome in {"revoke", "reanalyze"}:
+                updated = self.connection.execute(
+                    "UPDATE decisions SET status='revoked',revoked_by=?,revoked_at=?,revoke_reason=? "
+                    "WHERE decision_id=? AND status='active'",
+                    (actor_id, now, review_note, decision_row["decision_id"]),
+                ) if outcome == "revoke" else self.connection.execute(
+                    "UPDATE decisions SET status='superseded',superseded_at=? "
+                    "WHERE decision_id=? AND status='active'",
+                    (now, decision_row["decision_id"]),
+                )
+                if updated.rowcount != 1:
+                    raise InvalidState("原决定已失效，不能完成本次裁决")
+            if outcome == "reanalyze":
+                reanalysis_batch_id = self._create_reanalysis_batch(
+                    actor_id=actor_id,
+                    source_batch_id=batch_id,
+                    appeal_id=appeal_id,
+                    reason=review_note,
+                    now=now,
+                )
+                self.connection.execute(
+                    "UPDATE appeals SET reanalysis_batch_id=? WHERE appeal_id=?",
+                    (reanalysis_batch_id, appeal_id),
+                )
+            self._audit(
+                "batch",
+                batch_id,
+                f"appeal.{appeal_status}",
+                actor_id,
+                {
+                    "appeal_id": appeal_id,
+                    "decision_id": decision_row["decision_id"],
+                    "note": review_note,
+                    **({"reanalysis_batch_id": reanalysis_batch_id} if reanalysis_batch_id else {}),
+                },
+            )
+            if reanalysis_batch_id is not None:
+                self._audit(
+                    "batch",
+                    reanalysis_batch_id,
+                    "batch.reanalysis_created",
+                    actor_id,
+                    {
+                        "source_batch_id": batch_id,
+                        "appeal_id": appeal_id,
+                        "reason": review_note,
+                    },
+                )
+        return {
+            "appeal_id": appeal_id,
+            "outcome": outcome,
+            "status": appeal_status,
+            "reanalysis_batch_id": reanalysis_batch_id,
+        }
+
+    def _create_reanalysis_batch(
+        self,
+        *,
+        actor_id: str,
+        source_batch_id: str,
+        appeal_id: int,
+        reason: str,
+        now: str,
+    ) -> str:
+        """复制原批次数据生成新的批次修订，作为补充材料与重分析的载体。"""
+
+        source = self.get_batch(source_batch_id)
+        # 沿修订链找到根批次；新修订编号为链上批次总数（根为 1，首次重分析即 #r1）。
+        root = source
+        chain_length = 1
+        while root["reanalysis_of_batch"] is not None:
+            root = self.get_batch(root["reanalysis_of_batch"])
+            chain_length += 1
+        suffix = chain_length
+        while True:
+            new_batch_id = f"{root['batch_id']}#r{suffix}"
+            if self.connection.execute(
+                "SELECT 1 FROM batches WHERE batch_id=?", (new_batch_id,)
+            ).fetchone() is None:
+                break
+            suffix += 1
+        self.connection.execute(
+            "INSERT INTO batches(batch_id,protocol_id,protocol_version,build_id,state,revision,"
+            "created_by,created_at,started_at,reanalysis_of_batch,reanalysis_reason,reanalysis_appeal_id) "
+            "VALUES(?,?,?,?, 'running', 1,?,?,?,?,?,?)",
+            (
+                new_batch_id,
+                source["protocol_id"],
+                source["protocol_version"],
+                source["build_id"],
+                source["created_by"],
+                now,
+                now,
+                source_batch_id,
+                reason,
+                appeal_id,
+            ),
+        )
+        observations = self.connection.execute(
+            "SELECT * FROM observations WHERE batch_id=? ORDER BY observation_id",
+            (source_batch_id,),
+        ).fetchall()
+        old_to_new: dict[int, int] = {}
+        for row in observations:
+            cursor = self.connection.execute(
+                "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
+                "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    new_batch_id,
+                    row["source_batch"],
+                    row["source_row"],
+                    row["robot_id"],
+                    row["stratum_key"],
+                    row["observed_at"],
+                    row["metrics_json"],
+                    row["content_sha256"],
+                    row["imported_by"],
+                    row["imported_at"],
+                ),
+            )
+            old_to_new[row["observation_id"]] = cursor.lastrowid
+        approved = self.connection.execute(
+            "SELECT * FROM exclusion_requests WHERE observation_id IN (%s) AND status='approved'"
+            % ",".join("?" * len(observations)),
+            [row["observation_id"] for row in observations],
+        ).fetchall() if observations else []
+        for exclusion in approved:
+            self.connection.execute(
+                "INSERT INTO exclusion_requests(observation_id,status,reason,requested_by,requested_at,"
+                "reviewed_by,reviewed_at,review_note) VALUES(?, 'approved', ?,?,?,?,?,?)",
+                (
+                    old_to_new[exclusion["observation_id"]],
+                    exclusion["reason"],
+                    exclusion["requested_by"],
+                    exclusion["requested_at"],
+                    exclusion["reviewed_by"],
+                    exclusion["reviewed_at"],
+                    exclusion["review_note"],
+                ),
+            )
+        self._audit(
+            "batch",
+            source_batch_id,
+            "batch.revision_copied",
+            actor_id,
+            {
+                "new_batch_id": new_batch_id,
+                "observations_copied": len(observations),
+                "exclusions_copied": len(approved),
+            },
+        )
+        return new_batch_id
+
+    def _lineage(self, batch_id: str) -> list[sqlite3.Row]:
+        """返回根批次到最新修订（含被查询批次）的完整线性修订链。"""
+
+        ancestors: list[sqlite3.Row] = []
+        current = self.get_batch(batch_id)
+        while True:
+            ancestors.append(current)
+            parent_id = current["reanalysis_of_batch"]
+            if parent_id is None:
+                break
+            current = self.get_batch(parent_id)
+        chain = list(reversed(ancestors))
+        # 重分析只能发生在当前有效决定上，因此修订链为线性；沿子修订继续向下。
+        while True:
+            child = self.connection.execute(
+                "SELECT * FROM batches WHERE reanalysis_of_batch=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (chain[-1]["batch_id"],),
+            ).fetchone()
+            if child is None:
+                break
+            chain.append(child)
+        return chain
 
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
@@ -520,26 +834,111 @@ class TrialService:
             raise Forbidden("当前角色不能读取完整报告")
         batch = self.get_batch(batch_id)
         protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        analysis_row = self.connection.execute(
-            "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1", (batch_id,)
-        ).fetchone()
-        decision_row = None
-        if analysis_row is not None:
-            decision_row = self.connection.execute(
-                "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
-            ).fetchone()
+        chain = self._lineage(batch_id)
+        chain_ids = [item["batch_id"] for item in chain]
+        placeholders = ",".join("?" * len(chain_ids))
+
+        analyses = self.connection.execute(
+            f"SELECT * FROM analyses WHERE batch_id IN ({placeholders}) ORDER BY analysis_id",
+            chain_ids,
+        ).fetchall()
+        analysis_by_id = {row["analysis_id"]: row for row in analyses}
+        decisions = self.connection.execute(
+            f"SELECT * FROM decisions WHERE batch_id IN ({placeholders}) ORDER BY decision_id",
+            chain_ids,
+        ).fetchall()
+        decisions_by_id = {row["decision_id"]: row for row in decisions}
+        appeals = self.connection.execute(
+            f"SELECT * FROM appeals WHERE batch_id IN ({placeholders}) ORDER BY appeal_id",
+            chain_ids,
+        ).fetchall()
+        appeals_by_id = {row["appeal_id"]: row for row in appeals}
         exclusions = self.connection.execute(
-            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by "
+            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by,o.batch_id "
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
-            "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
+            f"WHERE o.batch_id IN ({placeholders}) ORDER BY e.exclusion_id",
+            chain_ids,
         ).fetchall()
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            "SELECT event_id,event_type,actor_id,payload_json,created_at,entity_id AS batch_id FROM audit_events "
+            f"WHERE entity_type='batch' AND entity_id IN ({placeholders}) ORDER BY event_id",
+            chain_ids,
         ).fetchall()
+
+        def analysis_brief(row: sqlite3.Row) -> dict[str, Any]:
+            result = json.loads(row["result_json"])
+            return {
+                "analysis_id": row["analysis_id"],
+                "batch_id": row["batch_id"],
+                "batch_revision": row["batch_revision"],
+                "input_sha256": row["input_sha256"],
+                "algorithm_version": row["algorithm_version"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+                "conclusion": result.get("conclusion"),
+                "result": result,
+            }
+
+        def decision_brief(row: sqlite3.Row) -> dict[str, Any]:
+            data = dict(row)
+            analysis_row = analysis_by_id.get(row["analysis_id"])
+            data["analysis"] = None if analysis_row is None else analysis_brief(analysis_row)
+            return data
+
+        # 按时间（审计事件序号）合并原决定、申诉、复议与新分析，形成可解释的责任链。
+        # 所有关键状态迁移都在同一事务写入审计事件，因此 event_id 给出严格因果顺序，
+        # 即使时钟分辨率不足或被冻结也不会乱序。
+        timeline: list[dict[str, Any]] = []
+        for event in events:
+            payload = json.loads(event["payload_json"])
+            entry: dict[str, Any] | None = None
+            if event["event_type"] == "analysis.completed":
+                row = analysis_by_id.get(payload.get("analysis_id"))
+                if row is not None:
+                    entry = {"kind": "analysis", "batch_id": row["batch_id"],
+                             "analysis": analysis_brief(row)}
+            elif event["event_type"] == "decision.recorded":
+                row = decisions_by_id.get(payload.get("decision_id"))
+                if row is not None:
+                    entry = {"kind": "decision", "batch_id": row["batch_id"],
+                             "decision": decision_brief(row)}
+            elif event["event_type"] == "appeal.submitted":
+                row = appeals_by_id.get(payload.get("appeal_id"))
+                if row is not None:
+                    entry = {"kind": "appeal", "batch_id": row["batch_id"], "appeal": dict(row)}
+            elif event["event_type"] in {
+                "appeal.upheld", "appeal.revoked", "appeal.reanalyze",
+            }:
+                row = appeals_by_id.get(payload.get("appeal_id"))
+                if row is not None:
+                    entry = {"kind": "appeal_review", "batch_id": row["batch_id"],
+                             "appeal": dict(row), "outcome": event["event_type"].split(".", 1)[1]}
+            elif event["event_type"] == "batch.reanalysis_created":
+                entry = {"kind": "revision", "batch_id": event["batch_id"], "change": payload}
+            if entry is not None:
+                entry["at"] = event["created_at"]
+                timeline.append(entry)
+
+        # 当前有效结论：沿修订链从新到旧找到第一份仍然有效的决定。
+        current_decision = next(
+            (row for row in reversed(decisions) if row["status"] == "active"), None
+        )
+        superseded = [decision_brief(row) for row in decisions if row["status"] != "active"]
+        current = None
+        if current_decision is not None:
+            current_analysis = analysis_by_id.get(current_decision["analysis_id"])
+            current = {
+                "decision": decision_brief(current_decision),
+                "analysis": None if current_analysis is None else analysis_brief(current_analysis),
+                "supersedes": superseded,
+            }
+        analysis_row = analyses[-1] if analyses else None
+        decision_row = next(
+            (row for row in reversed(decisions) if row["batch_id"] == batch_id), None
+        )
         return {
             "batch": batch,
+            "lineage": chain_ids,
             "protocol": {
                 "protocol_id": protocol.protocol_id,
                 "version": protocol.version,
@@ -547,14 +946,13 @@ class TrialService:
                 "seed": protocol.seed,
                 "bootstrap_samples": protocol.bootstrap_samples,
             },
-            "analysis": None if analysis_row is None else {
-                "analysis_id": analysis_row["analysis_id"],
-                "input_sha256": analysis_row["input_sha256"],
-                "algorithm_version": analysis_row["algorithm_version"],
-                "created_by": analysis_row["created_by"],
-                "result": json.loads(analysis_row["result_json"]),
-            },
-            "decision": None if decision_row is None else dict(decision_row),
+            "analysis": None if analysis_row is None else analysis_brief(analysis_row),
+            "decision": None if decision_row is None else decision_brief(decision_row),
+            "current_effective": current,
+            "analyses": [analysis_brief(row) for row in analyses],
+            "decisions": [decision_brief(row) for row in decisions],
+            "appeals": [dict(row) for row in appeals],
             "exclusions": [dict(row) for row in exclusions],
+            "timeline": timeline,
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

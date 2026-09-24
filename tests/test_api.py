@@ -33,6 +33,50 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status, 201)
         self.assertEqual(response.body["role"], "operator")
 
+    def test_appeal_routes_require_actor(self) -> None:
+        response = self.app.handle(
+            "POST",
+            "/appeals",
+            body=json.dumps({"batch_id": "b", "decision_id": 1, "evidence_summary": "x"}).encode(),
+        )
+        self.assertEqual(response.status, 422)
+        response = self.app.handle(
+            "POST",
+            "/appeals/1/review",
+            body=json.dumps({"outcome": "uphold", "note": "ok"}).encode(),
+        )
+        self.assertEqual(response.status, 422)
+
+    def test_appeal_review_route_enforces_role_and_wires_outcome(self) -> None:
+        for user_id, role in (
+            ("operator", "operator"),
+            ("stat", "statistician"),
+            ("approver", "approver"),
+            ("approver2", "approver"),
+        ):
+            self.app.handle(
+                "POST",
+                "/users",
+                body=json.dumps({"user_id": user_id, "display_name": user_id, "role": role}).encode(),
+            )
+        # 操作员无权复议：路由应返回 403 而不是落到 404。
+        response = self.app.handle(
+            "POST",
+            "/appeals/1/review",
+            headers={"X-Actor-Id": "operator"},
+            body=json.dumps({"outcome": "uphold", "note": "越权"}).encode(),
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error"]["code"], "forbidden")
+        # 合法审批人访问不存在的申诉应得到 404。
+        response = self.app.handle(
+            "POST",
+            "/appeals/999/review",
+            headers={"X-Actor-Id": "approver2"},
+            body=json.dumps({"outcome": "uphold", "note": "无此申诉"}).encode(),
+        )
+        self.assertEqual(response.status, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

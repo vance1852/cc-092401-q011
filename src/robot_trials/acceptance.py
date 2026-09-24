@@ -28,6 +28,7 @@ def run(workspace: Path) -> dict[str, object]:
             service.create_user("operator-1", "测试操作员", "operator")
             service.create_user("stat-1", "统计负责人", "statistician")
             service.create_user("approver-1", "准入审批人", "approver")
+            service.create_user("approver-2", "复议审批人", "approver")
             service.create_user("auditor-1", "审计人员", "auditor")
             service.register_robot("operator-1", "robot-a", "A 型人形机器人", "示例厂商")
             service.register_build("operator-1", "build-a1", "robot-a", "1.0.0", "a" * 64)
@@ -46,12 +47,23 @@ def run(workspace: Path) -> dict[str, object]:
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
+            decision_id = connection.execute(
+                "SELECT decision_id FROM decisions WHERE batch_id='batch-demo'"
+            ).fetchone()[0]
+            service.submit_appeal(
+                "operator-1", "batch-demo", decision_id, "对规则解释与数据排除的异议摘要"
+            )
+            appeal_id = connection.execute(
+                "SELECT appeal_id FROM appeals WHERE batch_id='batch-demo'"
+            ).fetchone()[0]
+            service.review_appeal("approver-2", appeal_id, "uphold", "原决定依据充分，予以维持")
             report = service.report("auditor-1", "batch-demo")
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
+    timeline_kinds = [item["kind"] for item in report["timeline"]]
     return {
         "status": "ok",
         "protocol": f"{protocol['protocol_id']}@{protocol['version']}",
@@ -60,6 +72,9 @@ def run(workspace: Path) -> dict[str, object]:
         "input_sha256": analysis["input_sha256"],
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
+        "appeal": report["appeals"][0]["status"],
+        "timeline_kinds": timeline_kinds,
+        "current_effective": report["current_effective"]["decision"]["decision"],
         "event_count": len(report["events"]),
         "schema": schema,
     }

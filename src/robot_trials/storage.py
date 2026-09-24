@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL,
     started_at TEXT,
     sealed_at TEXT,
+    reanalysis_of_batch TEXT REFERENCES batches(batch_id),
+    reanalysis_reason TEXT,
+    reanalysis_appeal_id INTEGER REFERENCES appeals(appeal_id),
     FOREIGN KEY (protocol_id, protocol_version) REFERENCES protocol_catalog(protocol_id, version)
 );
 
@@ -145,8 +148,45 @@ CREATE TABLE IF NOT EXISTS decisions (
     reason TEXT NOT NULL,
     decided_by TEXT NOT NULL REFERENCES users(user_id),
     decided_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'revoked', 'superseded')),
+    expires_at TEXT,
+    revoked_by TEXT REFERENCES users(user_id),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    superseded_by_decision_id INTEGER REFERENCES decisions(decision_id),
+    superseded_at TEXT,
     UNIQUE (batch_id, analysis_id)
 );
+
+-- 同一批次任一时刻至多一份当前有效决定（撤销或被取代后才允许再次决定）。
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_decision_per_batch
+ON decisions(batch_id)
+WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS appeals (
+    appeal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL REFERENCES decisions(decision_id),
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    evidence_summary TEXT NOT NULL,
+    requested_by TEXT NOT NULL REFERENCES users(user_id),
+    requested_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'upheld', 'revoked', 'reanalyze')),
+    reviewed_by TEXT REFERENCES users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    reanalysis_batch_id TEXT REFERENCES batches(batch_id),
+    UNIQUE (decision_id)
+);
+
+-- 同一批次至多存在一条待审申诉，阻止重复提交与并发双重裁决期间再次申诉。
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_appeal_per_batch
+ON appeals(batch_id)
+WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS appeals_by_batch ON appeals(batch_id);
+CREATE INDEX IF NOT EXISTS decisions_by_batch ON decisions(batch_id);
+CREATE INDEX IF NOT EXISTS batch_reanalysis_lineage ON batches(reanalysis_of_batch);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,7 +202,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "appeals", "audit_events",
 })
 
 
